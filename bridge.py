@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
-"""Muse bridge v5: OpenAI-compatible endpoint + worker pull API (no SSH).
+"""Muse bridge v6: OpenAI-compatible endpoint + worker pull API + multi-agent fan-out.
 
 9Router 'muse' provider -> http://127.0.0.1:8765/v1      (key role=user)
 Muse worker (sandbox)   -> https://<tunnel-url>/muse/*    (key role=worker)
                             tunnel via cloudflared quick tunnel (run-tunnel.ps1)
 
-v5 (new):
+v6 (new): multi-agent fan-out
+- POST /v1/fanout {"tasks":[...], "aggregate_prompt": "..."} splits one
+  request into N parallel child jobs. Workers claim children with the
+  UNCHANGED /muse/pending protocol. When all children are answered, the
+  bridge spawns an aggregate job (also a normal job); a worker synthesizes
+  the final answer, which is delivered to the waiting parent long-poll.
+- GET /v1/fanout/<parent_id> -> status of a fan-out ({done, total, ...}).
+- Fan-out trackers live in fanout/<parent_id>.json; stale trackers are
+  reaped by the sweeper.
+
+v5:
 - Role-based API keys stored in keys.json (NOT printed except at creation):
     python bridge.py keygen --role worker --label muse-vm   # prints key ONCE
     python bridge.py keygen --role user   --label 9router
@@ -55,6 +65,7 @@ QUEUE = os.environ.get("BRIDGE_QUEUE", "/home/ubuntu/muse-bridge/queue").rstrip(
 PENDING = f"{QUEUE}/pending"
 DONE = f"{QUEUE}/done"
 PROCESSING = f"{QUEUE}/processing"
+FANOUT = f"{QUEUE}/fanout"
 KEYS_FILE = os.environ.get("BRIDGE_KEYS",
                            os.path.join(os.path.dirname(QUEUE), "keys.json"))
 MAX_PENDING = 5
@@ -65,6 +76,16 @@ MAX_BODY = 10 * 1024 * 1024  # 10 MB per request body
 TOKEN = os.environ.get("BRIDGE_TOKEN", "").strip()  # legacy user key on /v1/*
 DONE_ORPHAN_SECS = 600
 PROCESSING_STALE_SECS = 600  # fallback when a job has no/invalid lease info
+# --- fan-out (v6) ---
+MAX_FANOUT_TASKS = 10
+FANOUT_WAIT_SECS = 240
+FANOUT_STALE_SECS = 900  # tracker older than this gets reaped by sweeper
+DEFAULT_AGGREGATE_PROMPT = (
+    "Kamu menerima hasil dari beberapa sub-task yang dikerjakan paralel. "
+    "Rangkum semuanya menjadi SATU jawaban akhir yang utuh, koheren, dan "
+    "langsung menjawab kebutuhan pengguna. Jangan sebutkan bahwa ini hasil "
+    "gabungan beberapa task."
+)
 
 LOCK = threading.Lock()
 RECENT_DONE = {}  # job id -> timestamp of completion (for duplicate-answer detection)
@@ -137,6 +158,13 @@ def _job_path(d, jid):
     return os.path.join(d, safe + ".json")
 
 
+def _write_json_atomic(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
 def _claim_jobs(limit, worker_label):
     """Atomically move up to `limit` pending jobs to processing/ with a lease."""
     claimed, now = [], time.time()
@@ -165,7 +193,12 @@ def _claim_jobs(limit, worker_label):
             os.replace(tmp, dst)
             claimed.append({"id": job.get("id", fn[:-5]),
                             "received_at": job.get("received_at"),
-                            "request": job.get("request", {})})
+                            "request": job.get("request", {}),
+                            # v6 fan-out markers so workers can tell
+                            # child/aggregate jobs apart from normal ones
+                            "parent_id": job.get("parent_id"),
+                            "child_index": job.get("child_index"),
+                            "aggregate_for": job.get("aggregate_for")})
         try:
             pending_n = sum(1 for f in os.listdir(PENDING) if f.endswith(".json"))
         except Exception:
@@ -174,10 +207,24 @@ def _claim_jobs(limit, worker_label):
 
 
 def _answer_job(jid, content):
-    """Returns 'ok' | 'duplicate' | None (unknown id)."""
+    """Returns 'ok' | 'duplicate' | None (unknown id).
+
+    Fan-out hooks (v6): if the answered job is a child (has parent_id),
+    record it in the fan-out tracker and spawn the aggregate job when all
+    children are done. If it is an aggregate job (has aggregate_for), its
+    content becomes the parent's answer in done/<parent_id>.json.
+    """
     with LOCK:
         p = _job_path(PROCESSING, jid)
+        parent_id, aggregate_for = None, None
         if os.path.exists(p):
+            try:
+                with open(p) as f:
+                    job = json.load(f)
+                parent_id = job.get("parent_id")
+                aggregate_for = job.get("aggregate_for")
+            except Exception:
+                pass
             try:
                 os.remove(p)
             except Exception:
@@ -190,11 +237,14 @@ def _answer_job(jid, content):
         else:
             return None
         dp = _job_path(DONE, jid)
-        tmp = dp + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"content": content, "answered_at": time.time()}, f)
-        os.replace(tmp, dp)
+        _write_json_atomic(dp, {"content": content,
+                                "answered_at": time.time()})
         RECENT_DONE[jid] = time.time()
+        if first:
+            if parent_id:
+                _on_child_answered(parent_id, jid, content)
+            if aggregate_for:
+                _finish_parent(aggregate_for, content)
     return "ok" if first else "duplicate"
 
 
@@ -220,6 +270,120 @@ def _release_job(jid):
         except Exception:
             pass
     return True
+
+
+# ------------------------------------------------------------ fan-out ---
+def _tracker_path(pid):
+    safe = "".join(c for c in pid if c.isalnum())[:64]
+    return os.path.join(FANOUT, safe + ".json")
+
+
+def _fanout_tracker(pid):
+    try:
+        with open(_tracker_path(pid)) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _save_tracker(t):
+    _write_json_atomic(_tracker_path(t["id"]), t)
+
+
+def _spawn_fanout(model, strategy, agg_prompt, tasks):
+    """Create parent tracker + N child jobs. Returns parent_id.
+
+    Must be called with LOCK held (or from a context that holds it).
+    Child jobs are normal pending/ jobs with parent_id/child_index fields,
+    so existing workers claim them with the unchanged /muse/pending protocol.
+    """
+    pid = uuid.uuid4().hex
+    children = []
+    for i, t in enumerate(tasks[:MAX_FANOUT_TASKS]):
+        if not isinstance(t, dict):
+            continue
+        cid = uuid.uuid4().hex
+        job = {"id": cid, "received_at": time.time(),
+               "parent_id": pid, "child_index": i,
+               "request": {"model": model, **t}}
+        _write_json_atomic(_job_path(PENDING, cid), job)
+        children.append(cid)
+    _save_tracker({"id": pid, "created_at": time.time(), "model": model,
+                   "strategy": strategy, "aggregate_prompt": agg_prompt,
+                   "children": children, "answers": {}, "status": "running"})
+    return pid
+
+
+def _spawn_aggregate_job(t, partial=False):
+    """Create the aggregate job whose answer becomes the parent's answer."""
+    parts = []
+    for i, cid in enumerate(t["children"]):
+        ans = t["answers"].get(cid, "(belum ada jawaban)")
+        parts.append(f"Hasil sub-task {i + 1}:\n{ans}")
+    prompt = t["aggregate_prompt"]
+    if partial:
+        prompt += ("\n\nCatatan: hanya sebagian sub-task yang selesai tepat "
+                   "waktu. Rangkum dari hasil yang tersedia.")
+    agg_id = "agg-" + t["id"]
+    job = {"id": agg_id, "received_at": time.time(),
+           "aggregate_for": t["id"],
+           "request": {"model": t["model"], "messages": [
+               {"role": "system", "content": prompt},
+               {"role": "user", "content": "\n\n".join(parts)}]}}
+    _write_json_atomic(_job_path(PENDING, agg_id), job)
+    return agg_id
+
+
+def _on_child_answered(pid, cid, content):
+    """Record a child's answer; spawn aggregate job when all are done.
+
+    Called from _answer_job while LOCK is held.
+    """
+    t = _fanout_tracker(pid)
+    if not t or t.get("status") != "running":
+        return
+    t["answers"][cid] = content
+    if len(t["answers"]) >= len(t["children"]):
+        t["status"] = "aggregating"
+        _save_tracker(t)
+        _spawn_aggregate_job(t)
+    else:
+        _save_tracker(t)
+
+
+def _finish_parent(pid, content):
+    """Write the aggregate result as the parent's answer.
+
+    Called from _answer_job while LOCK is held. The parent's long-poll
+    (_wait_answer) picks this up from done/<pid>.json.
+    """
+    _write_json_atomic(_job_path(DONE, pid),
+                       {"content": content, "answered_at": time.time(),
+                        "aggregated": True})
+    t = _fanout_tracker(pid)
+    if t:
+        t["status"] = "done"
+        _save_tracker(t)
+
+
+def _cleanup_fanout(pid):
+    """Best-effort cleanup after a fan-out finishes or times out."""
+    t = _fanout_tracker(pid)
+    if t:
+        for cid in t.get("children", []):
+            for d in (PENDING, PROCESSING):
+                try:
+                    os.remove(_job_path(d, cid))
+                except Exception:
+                    pass
+        try:
+            os.remove(_job_path(PENDING, "agg-" + pid))
+        except Exception:
+            pass
+        try:
+            os.remove(_job_path(PROCESSING, "agg-" + pid))
+        except Exception:
+            pass
 
 
 def _sweep_once():
@@ -260,6 +424,42 @@ def _sweep_once():
         cutoff = now - RECENT_DONE_TTL
         for jid in [j for j, ts in RECENT_DONE.items() if ts < cutoff]:
             del RECENT_DONE[jid]
+    except Exception:
+        pass
+    # reap stale fan-out trackers (v6)
+    try:
+        for fn in os.listdir(FANOUT):
+            if not fn.endswith(".json"):
+                continue
+            p = os.path.join(FANOUT, fn)
+            try:
+                with open(p) as f:
+                    t = json.load(f)
+            except Exception:
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+                continue
+            if t.get("status") in ("done",):
+                try:
+                    if now - t.get("created_at", now) > 3600:
+                        os.remove(p)
+                except Exception:
+                    pass
+            elif now - t.get("created_at", now) > FANOUT_STALE_SECS:
+                t["status"] = "timeout"
+                try:
+                    with open(p, "w") as f:
+                        json.dump(t, f)
+                except Exception:
+                    pass
+                for cid in t.get("children", []):
+                    for d in (PENDING, PROCESSING):
+                        try:
+                            os.remove(_job_path(d, cid))
+                        except Exception:
+                            pass
     except Exception:
         pass
 
@@ -369,6 +569,21 @@ class H(BaseHTTPRequestHandler):
                      "owned_by": "muse"}]})
             elif path == "/health":
                 self._send(200, {"ok": True})
+            elif path.startswith("/v1/fanout/"):
+                # --- fan-out status (v6) ---
+                if not self._require("user"):
+                    return
+                pid = "".join(c for c in path[len("/v1/fanout/"):]
+                             if c.isalnum())[:64]
+                t = _fanout_tracker(pid)
+                if not t:
+                    return self._send(404, {"error": {"message":
+                        "unknown fan-out id"}})
+                children = [{"id": cid, "done": cid in t.get("answers", {})}
+                            for cid in t.get("children", [])]
+                self._send(200, {"id": pid, "status": t.get("status"),
+                                 "done": sum(1 for c in children if c["done"]),
+                                 "total": len(children), "children": children})
             elif path.rstrip("/") == "/muse/pending":
                 if not self._require("worker"):
                     return
@@ -397,8 +612,8 @@ class H(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-    def _wait_answer(self, rid: str, keepalive_cb=None):
-        deadline = time.time() + WAIT_SECS
+    def _wait_answer(self, rid: str, wait_secs=None, keepalive_cb=None):
+        deadline = time.time() + (WAIT_SECS if wait_secs is None else wait_secs)
         answer, last_ping = None, time.time()
         while time.time() < deadline:
             dp = _job_path(DONE, rid)
@@ -450,6 +665,41 @@ class H(BaseHTTPRequestHandler):
                 if answer is None:
                     return self._send(504, {"error": {"message":
                         "Muse did not answer in time"}})
+                self._send(200, _completion(answer))
+            elif path == "/v1/fanout":
+                # --- multi-agent fan-out (v6) ---
+                if not self._require("user"):
+                    return
+                req = self._read_json()
+                if req is None:
+                    return
+                tasks = req.get("tasks")
+                if not isinstance(tasks, list) or not tasks:
+                    return self._send(400, {"error": {"message":
+                        "need non-empty 'tasks' array"}})
+                if len(tasks) > MAX_FANOUT_TASKS:
+                    return self._send(400, {"error": {"message":
+                        f"max {MAX_FANOUT_TASKS} tasks per fan-out"}})
+                model = req.get("model", "muse")
+                strategy = req.get("strategy", "parallel")
+                agg_prompt = (req.get("aggregate_prompt")
+                              or DEFAULT_AGGREGATE_PROMPT)
+                with LOCK:
+                    pid = _spawn_fanout(model, strategy, agg_prompt, tasks)
+                answer = self._wait_answer(pid, FANOUT_WAIT_SECS)
+                if answer is None:
+                    # timeout: aggregate whatever children answered so far
+                    with LOCK:
+                        t = _fanout_tracker(pid)
+                        if t and t.get("status") == "running" and t.get("answers"):
+                            t["status"] = "aggregating"
+                            _save_tracker(t)
+                            _spawn_aggregate_job(t, partial=True)
+                    answer = self._wait_answer(pid, 120)
+                    _cleanup_fanout(pid)
+                if answer is None:
+                    return self._send(504, {"error": {"message":
+                        "fan-out timed out"}})
                 self._send(200, _completion(answer))
             elif path == "/muse/answer":
                 if not self._require("worker"):
@@ -544,7 +794,7 @@ def _completion(answer: str):
 # ------------------------------------------------------------------ ---
 def cmd_serve():
     import subprocess
-    for d in (PENDING, DONE, PROCESSING):
+    for d in (PENDING, DONE, PROCESSING, FANOUT):
         os.makedirs(d, exist_ok=True)
     # crash recovery: anything left in processing/ goes back to pending/
     try:
